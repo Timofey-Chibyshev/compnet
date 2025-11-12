@@ -8,6 +8,8 @@ import matplotlib.animation as animation
 from typing import List, Dict, Any
 import matplotlib.patches as patches
 
+DR_ID = 1000 
+
 class LogVisualizer:
     def __init__(self, log_file: str):
         self.log_file = log_file
@@ -36,49 +38,41 @@ class LogVisualizer:
         
         print(f"Загружено {len(self.events)} событий")
         
-        # Извлекаем информацию о симуляции
         for event in self.events:
             if event['event_type'] == 'TOPOLOGY_CREATED':
                 self.topology_type = event['data']['topology_type']
                 self.simulation_id = event['simulation_id']
                 break
-    
+
     def extract_topology(self):
-        """Извлечение топологии из логов - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+        """Извлечение топологии из логов без дублирующих рёбер"""
         print("Извлечение топологии...")
-        
-        # Сначала собираем все соединения из LINKS_CREATED
-        connections = []
+
+        connections = set()
         for event in self.events:
             if event['event_type'] == 'LINKS_CREATED':
-                connections.extend(event['data']['connections'])
-        
-        # Добавляем узлы и рёбра в граф
-        for conn in connections:
-            if len(conn) >= 2:
-                self.topology.add_edge(conn[0], conn[1])
-                # Также добавляем обратное направление для двусторонних связей
-                self.topology.add_edge(conn[1], conn[0])
-        
-        # Если в LINKS_CREATED нет данных, пробуем из TOPOLOGY_BROADCAST
+                for conn in event['data']['connections']:
+                    if len(conn) >= 2:
+                        connections.add(tuple(sorted((conn[0], conn[1]))))
+
+        self.topology.clear()
+        for u, v in connections:
+            self.topology.add_edge(u, v)
+
         if len(self.topology.edges()) == 0:
             for event in self.events:
                 if event['event_type'] == 'TOPOLOGY_BROADCAST':
                     topology_data = event['data'].get('topology', {})
                     nodes = topology_data.get('nodes', [])
                     edges = topology_data.get('edges', [])
-                    
-                    self.topology.clear()
                     self.topology.add_nodes_from(nodes)
                     for edge in edges:
                         if len(edge) >= 2:
-                            u, v = edge[0], edge[1]
-                            self.topology.add_edge(u, v)
+                            self.topology.add_edge(edge[0], edge[1])
                     break
-        
+
         print(f"Топология: {len(self.topology.nodes())} узлов, {len(self.topology.edges())} связей")
-        
-        # Создаем позиции узлов
+
         if self.topology_type == "linear":
             self.pos = self._get_linear_positions()
         elif self.topology_type == "ring":
@@ -87,18 +81,16 @@ class LogVisualizer:
             self.pos = self._get_star_positions()
         else:
             self.pos = nx.spring_layout(self.topology, seed=42)
-    
+
     def _get_linear_positions(self):
         """Позиции для линейной топологии"""
         pos = {}
         nodes = sorted([n for n in self.topology.nodes() if n != -1])
         designated_router = -1
         
-        # Располагаем обычные маршрутизаторы по линии
         for i, node in enumerate(nodes):
             pos[node] = (i * 2, 0)
         
-        # Располагаем выделенный маршрутизатор сверху
         if designated_router in self.topology.nodes():
             center_x = (len(nodes) - 1) * 2 / 2 if nodes else 0
             pos[designated_router] = (center_x, 2)
@@ -111,13 +103,11 @@ class LogVisualizer:
         nodes = sorted([n for n in self.topology.nodes() if n != -1])
         designated_router = -1
         
-        # Располагаем обычные маршрутизаторы по кругу
         radius = 3
         for i, node in enumerate(nodes):
             angle = 2 * np.pi * i / len(nodes)
             pos[node] = (radius * np.cos(angle), radius * np.sin(angle))
         
-        # Располагаем выделенный маршрутизатор в центре
         if designated_router in self.topology.nodes():
             pos[designated_router] = (0, 0)
         
@@ -129,112 +119,77 @@ class LogVisualizer:
         nodes = sorted([n for n in self.topology.nodes() if n != -1])
         designated_router = -1
         
-        if 0 in nodes:  # Центральный узел
+        if 0 in nodes:
             pos[0] = (0, 0)
             peripheral_nodes = [n for n in nodes if n != 0]
             
-            # Располагаем периферийные узлы по кругу вокруг центрального
             radius = 3
             for i, node in enumerate(peripheral_nodes):
                 angle = 2 * np.pi * i / len(peripheral_nodes)
                 pos[node] = (radius * np.cos(angle), radius * np.sin(angle))
         else:
-            # Если нет узла 0, используем кольцевую компоновку
             return self._get_ring_positions()
         
-        # Располагаем выделенный маршрутизатор сверху
         if designated_router in self.topology.nodes():
             pos[designated_router] = (0, 5)
         
         return pos
     
-    def visualize_static_topology(self, show_weights=False):
-        """Статическая визуализация топологии с цветовым кодированием стрелок"""
+    def visualize_static_topology(self):
+        """Статическая визуализация топологии для отчета с правильным DR"""
         if len(self.topology.nodes()) == 0:
-            print("Ошибка: Топология пуста. Нечего визуализировать.")
+            print("Ошибка: топология пуста.")
             return
-            
-        plt.figure(figsize=(14, 10))
-        
-        # Разделяем ребра на два типа
-        dr_edges = []  # Соединения с выделенным маршрутизатором
-        router_edges = []  # Соединения между обычными маршрутизаторами
-        
+
+        plt.figure(figsize=(12, 8))
+
+        dr_edges = []
+        router_edges = []
         for u, v in self.topology.edges():
-            if u == -1 or v == -1:
+            if u == DR_ID or v == DR_ID:
                 dr_edges.append((u, v))
             else:
                 router_edges.append((u, v))
-        
-        print(f"DR edges: {len(dr_edges)}")
-        print(f"Router edges: {len(router_edges)}")
-        print(f"All edges: {list(self.topology.edges())}")
-        
-        # Рисуем узлы
-        node_colors = []
-        node_sizes = []
-        for node in self.topology.nodes():
-            if node == -1:
-                node_colors.append('red')  # Выделенный маршрутизатор
-                node_sizes.append(2000)
-            else:
-                node_colors.append('lightblue')
-                node_sizes.append(1200)
-        
+
+        node_colors = ['red' if n == DR_ID else 'skyblue' for n in self.topology.nodes()]
+        node_sizes = [2000 if n == DR_ID else 1200 for n in self.topology.nodes()]
         nx.draw_networkx_nodes(self.topology, self.pos, node_color=node_colors, 
-                            node_size=node_sizes, alpha=0.9, edgecolors='black', 
-                            linewidths=2)
-        
-        # Рисуем соединения с выделенным маршрутизатором (красные стрелки)
+                            node_size=node_sizes, edgecolors='black', linewidths=2)
+
         if dr_edges:
-            nx.draw_networkx_edges(self.topology, self.pos, edgelist=dr_edges,
-                                edge_color='red', width=2.5, alpha=0.8,
-                                arrows=True, arrowsize=25, arrowstyle='->',
-                                connectionstyle='arc3,rad=0.1')
-        
-        # Рисуем соединения между обычными маршрутизаторами (синие стрелки)
+            nx.draw_networkx_edges(self.topology, self.pos, edgelist=dr_edges, 
+                                edge_color='red', width=2.5, arrows=True, 
+                                arrowsize=25, arrowstyle='-|>', connectionstyle='arc3,rad=0.1')
         if router_edges:
-            nx.draw_networkx_edges(self.topology, self.pos, edgelist=router_edges,
-                                edge_color='blue', width=2, alpha=0.7,
-                                arrows=True, arrowsize=20, arrowstyle='->',
-                                connectionstyle='arc3,rad=0.1')
-        
-        # Подписываем узлы
-        labels = {node: f"Router {node}" for node in self.topology.nodes()}
-        nx.draw_networkx_labels(self.topology, self.pos, labels, 
-                            font_size=10, font_weight='bold')
-        
-        # Добавляем легенду
+            nx.draw_networkx_edges(self.topology, self.pos, edgelist=router_edges, 
+                                edge_color='blue', width=2, arrows=True, 
+                                arrowsize=20, arrowstyle='-|>', connectionstyle='arc3,rad=0.05')
+
+        labels = {n: 'DR' if n == DR_ID else f'Router {n}' for n in self.topology.nodes()}
+        nx.draw_networkx_labels(self.topology, self.pos, labels, font_size=10, font_weight='bold')
+
         legend_elements = [
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', 
-                    markersize=10, label='Designated Router'),
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightblue', 
-                    markersize=10, label='Router'),
-            plt.Line2D([0], [0], color='red', lw=2, label='DR Connection'),
-            plt.Line2D([0], [0], color='blue', lw=2, label='Router Connection')
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='DR'),
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='skyblue', markersize=10, label='Router'),
+            plt.Line2D([0], [0], color='red', lw=2, label='DR Link'),
+            plt.Line2D([0], [0], color='blue', lw=2, label='Router Link')
         ]
-        plt.legend(handles=legend_elements, loc='upper right', 
-                bbox_to_anchor=(1.15, 1), fontsize=10)
-        
-        plt.title(f"Топология сети: {self.topology_type}\n"
-                f"Simulation ID: {self.simulation_id}", fontsize=14, pad=20)
+        plt.legend(handles=legend_elements, loc='upper right', fontsize=10)
+
         plt.axis('off')
+        plt.title(f"Топология сети: {self.topology_type}\nSimulation ID: {self.simulation_id}", fontsize=14)
         plt.tight_layout()
-        
-        # Сохраняем изображение
+
         os.makedirs("topology_plots", exist_ok=True)
         filename = f"topology_plots/{self.simulation_id}_topology.png"
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         print(f"Топология сохранена как: {filename}")
-        
         plt.show()
 
-    # Остальные методы остаются без изменений
     def create_animation(self, save_as_gif=False):
         """Создание анимированной визуализации событий"""
         self.fig, self.ax = plt.subplots(figsize=(16, 12))
         
-        # Создаем анимацию
         frames = min(len(self.events), 200)
         
         self.anim = animation.FuncAnimation(
@@ -317,52 +272,41 @@ class LogVisualizer:
             'progress': 0.0,
             'start_frame': frame
         }
-    
+        
     def _draw_topology(self):
-        """Отрисовка топологии"""
-        node_colors = []
-        node_sizes = []
-        for node in self.topology.nodes():
-            if node == -1:
-                node_colors.append('red')
-                node_sizes.append(2000)
-            else:
-                node_colors.append('lightblue')
-                node_sizes.append(1200)
-        
+        """Отрисовка топологии с выделением DR и его соединений"""
+        node_colors = ['red' if n == DR_ID else 'lightblue' for n in self.topology.nodes()]
+        node_sizes = [2000 if n == DR_ID else 1200 for n in self.topology.nodes()]
+
         nx.draw_networkx_nodes(self.topology, self.pos, node_color=node_colors, 
-                             node_size=node_sizes, alpha=0.9, edgecolors='black', 
-                             linewidths=2, ax=self.ax)
-        
-        # Разделяем ребра для анимации
+                            node_size=node_sizes, alpha=0.9, edgecolors='black', 
+                            linewidths=2, ax=self.ax)
+
         dr_edges = []
         router_edges = []
-        
         for u, v in self.topology.edges():
-            if u == -1 or v == -1:
+            if u == DR_ID or v == DR_ID:
                 dr_edges.append((u, v))
             else:
                 router_edges.append((u, v))
-        
-        # Рисуем рёбра с цветовым кодированием
+
         if dr_edges:
             nx.draw_networkx_edges(self.topology, self.pos, edgelist=dr_edges,
-                                edge_color='red', width=2, alpha=0.6,
-                                arrows=True, arrowsize=20, arrowstyle='->',
-                                ax=self.ax)
-        
+                                edge_color='red', width=2.5, alpha=0.8,
+                                arrows=True, arrowsize=25, arrowstyle='->',
+                                connectionstyle='arc3,rad=0.1', ax=self.ax)
+
         if router_edges:
             nx.draw_networkx_edges(self.topology, self.pos, edgelist=router_edges,
                                 edge_color='blue', width=1.5, alpha=0.6,
-                                arrows=True, arrowsize=15, arrowstyle='->',
-                                ax=self.ax)
-        
-        labels = {node: f"Router {node}" for node in self.topology.nodes()}
-        nx.draw_networkx_labels(self.topology, self.pos, labels, font_size=10, 
-                              font_weight='bold', ax=self.ax)
-    
+                                arrows=True, arrowsize=20, arrowstyle='->',
+                                connectionstyle='arc3,rad=0.05', ax=self.ax)
+
+        labels = {n: ('DR' if n == DR_ID else f'Router {n}') for n in self.topology.nodes()}
+        nx.draw_networkx_labels(self.topology, self.pos, labels, font_size=10, font_weight='bold', ax=self.ax)
+
     def _draw_messages(self, current_frame):
-        """Отрисовка активных сообщений"""
+        """Отрисовка активных сообщений с выделением сообщений от DR"""
         messages_to_remove = []
         
         for msg_id, msg_data in self.active_messages.items():
@@ -383,15 +327,19 @@ class LogVisualizer:
                 current_x = start_pos[0] + (end_pos[0] - start_pos[0]) * msg_data['progress']
                 current_y = start_pos[1] + (end_pos[1] - start_pos[1]) * msg_data['progress']
                 
-                color = 'blue' if msg_type == 'DATA' else 'green'
+                if from_node == -1:
+                    color = 'red'
+                else:
+                    color = 'blue' if msg_type == 'DATA' else 'green'
+                
                 marker = 'o' if msg_type == 'DATA' else 's'
                 size = 100 if msg_type == 'DATA' else 80
                 
                 self.ax.scatter(current_x, current_y, c=color, marker=marker, s=size, alpha=0.8)
                 
                 if msg_type == 'DATA':
-                    self.ax.text(current_x, current_y + 0.3, "DATA", 
-                               fontsize=8, ha='center', va='bottom', color=color)
+                    self.ax.text(current_x, current_y + 0.3, "DATA", fontsize=8, 
+                                ha='center', va='bottom', color=color)
         
         for msg_id in messages_to_remove:
             del self.active_messages[msg_id]
@@ -574,4 +522,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

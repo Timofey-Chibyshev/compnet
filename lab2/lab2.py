@@ -48,7 +48,6 @@ class Link:
         self.message_queue = queue.Queue()
         self.active = True
         self.message_count = 0
-        # блокировка для атомарной проверки состояния
         self.lock = threading.Lock()
     
     def send(self, message: Message):
@@ -56,7 +55,6 @@ class Link:
             if not self.active:
                 return
             self.message_count += 1
-        # Имитация задержки сети
         def delayed_put():
             time.sleep(self.delay)
             with self.lock:
@@ -75,8 +73,8 @@ class Router:
         self.id = router_id
         self.designated_router_id = designated_router_id
         self.simulator = simulator
-        self.links: Dict[int, Link] = {}  # neighbor_id -> Link
-        self.neighbors: List[int] = []  # всегда хранит список id соседей (ints). FIXED
+        self.links: Dict[int, Link] = {} 
+        self.neighbors: List[int] = []
         self.topology = None
         self.shortest_paths: Dict[int, List[int]] = {}
         self.message_log = []
@@ -84,7 +82,6 @@ class Router:
         self.message_count = 0
         self.hello_received = []
         
-        # Поток для обработки входящих сообщений
         self.thread = threading.Thread(target=self._process_messages)
         self.thread.daemon = True
     
@@ -93,19 +90,16 @@ class Router:
     
     def start(self):
         self.thread.start()
-        # Отправляем HELLO-пакеты всем соседям
         self._send_hello_messages()
     
     def stop(self):
         self.running = False
-        # даём немного времени потоку завершиться
         if self.thread.is_alive():
             self.thread.join(timeout=1)
     
     def _send_hello_messages(self):
         """Отправка HELLO-пакетов только соседям-роутерам, не DR"""
         for neighbor_id in list(self.links.keys()):
-            # Пропускаем служебный DR
             if self.simulator and neighbor_id == self.simulator.designated_router.id:
                 continue
             hello_msg = Message(
@@ -128,7 +122,6 @@ class Router:
             self.message_count += 1
             self.links[neighbor_id].send(message)
         else:
-            # Попытка отправить по несуществующему линку — логируем
             self._log("SEND_FAILED_NO_LINK", {
                 "attempted_to": neighbor_id,
                 "message": message.to_dict()
@@ -139,16 +132,12 @@ class Router:
             for neighbor_id, link in list(self.links.items()):
                 message = link.receive()
                 if message:
-                    # Некоторые сообщения (например HELLO) приходят с dest конкретным neighbor_id,
-                    # поэтому проверяем адресность внутри _handle_message
                     self._handle_message(message)
             time.sleep(0.05)
     
     def _handle_message(self, message: Message):
-        # При адресованных сообщениях отбрасываем не для нас (кроме HELLO — считаем, что HELLO может считаться локальным установлением соседства)
         if message.dest_id is not None and message.dest_id != self.id:
             if message.type != MessageType.HELLO:
-                # игнорируем
                 return
                 
         if self.simulator:
@@ -183,7 +172,6 @@ class Router:
             return
         if message.source_id not in self.hello_received:
             self.hello_received.append(message.source_id)
-            # Поддерживаем также список neighbors как список id (если линк доступен)
             if message.source_id not in self.neighbors and message.source_id in self.links:
                 self.neighbors.append(message.source_id)
             if self.simulator:
@@ -198,7 +186,6 @@ class Router:
     
     def _handle_get_neighbors(self, message: Message):
         """Отправка информации о соседях выделенному маршрутизатору"""
-        # Формируем список соседей в формате, который ожидает DR: список словарей
         neighbors_info = []
         for neighbor_id in self.hello_received:
             if neighbor_id in self.links:
@@ -213,7 +200,6 @@ class Router:
             msg_type=MessageType.SET_NEIGHBORS,
             data=neighbors_info
         )
-        # отправляем к DR (предполагается, что у роутера есть линк к DR)
         self._send_to_neighbor(self.designated_router_id, response)
         if self.simulator:
             self.simulator._log_message_event(response, "SET_NEIGHBORS_SENT", {
@@ -231,11 +217,9 @@ class Router:
         """Если роутеру прилетает подтверждение соседей (может использоваться DR) — приводим к list[int]"""
         data = message.data
         if isinstance(data, list):
-            # возможны два формата: список id или список dicts
             if len(data) > 0 and isinstance(data[0], dict):
                 self.neighbors = [d["neighbor_id"] for d in data]
             else:
-                # список id
                 self.neighbors = list(data)
         else:
             self.neighbors = []
@@ -251,16 +235,13 @@ class Router:
         """Получение топологии сети и вычисление кратчайших путей"""
         topology_data = message.data
         G = nx.Graph()
-        # создаём все узлы
         for node in topology_data["nodes"]:
             G.add_node(node)
-        # создаём все рёбра
         for edge in topology_data["edges"]:
             u, v, weight = edge
             G.add_edge(u, v, weight=weight)
         self.topology = G
 
-        # логирование
         if self.simulator:
             self.simulator._log_router_event(self.id, "TOPOLOGY_RECEIVED", {
                 "topology_nodes": list(self.topology.nodes()),
@@ -271,7 +252,6 @@ class Router:
             "topology_edges": [(u, v, d['weight']) for u, v, d in self.topology.edges(data=True)]
         })
 
-        # пересчёт кратчайших путей
         self._calculate_shortest_paths()
     
     def _calculate_shortest_paths(self):
@@ -302,7 +282,6 @@ class Router:
     def _handle_data(self, message: Message):
         """Обработка DATA-сообщений"""
         if message.dest_id == self.id:
-            # Сообщение дошло до адресата
             if self.simulator:
                 self.simulator._log_message_event(message, "MESSAGE_DELIVERED", {
                     "final_destination": self.id,
@@ -314,7 +293,6 @@ class Router:
                 "final_destination": self.id
             })
         else:
-            # Пересылаем сообщение дальше по кратчайшему пути
             if message.dest_id in self.shortest_paths:
                 path = self.shortest_paths[message.dest_id]
                 if len(path) > 1:
@@ -345,7 +323,6 @@ class Router:
                         "message_id": forward_msg.message_id
                     })
                 else:
-                    # уже на месте?
                     self._log("DATA_AT_DESTINATION", {"dest": message.dest_id})
             else:
                 if self.simulator:
@@ -362,17 +339,14 @@ class Router:
         """Обработка разрыва связи. message.data = id соседа, который стал недоступен"""
         router_to_disconnect = message.data
 
-        # Деактивируем линк
         link = self.links.get(router_to_disconnect)
         if link:
             with link.lock:
                 link.active = False
 
-        # Удаляем роутер из соседей и hello_received
         self.neighbors = [r for r in self.neighbors if r != router_to_disconnect]
         self.hello_received = [r for r in self.hello_received if r != router_to_disconnect]
 
-        # Логирование
         log_data = {
             "disconnected_router": router_to_disconnect,
             "remaining_neighbors": self.neighbors.copy(),
@@ -382,7 +356,6 @@ class Router:
         if self.simulator:
             self.simulator._log_router_event(self.id, "LINK_DISCONNECTED", log_data)
 
-        # Пересчёт кратчайших путей безопасно
         self._calculate_shortest_paths()
     
     def send_data(self, dest_id: int, data: Any):
@@ -460,7 +433,7 @@ class DesignatedRouter(Router):
     
     def _request_neighbors(self):
         """Запрос информации о соседях у всех маршрутизаторов с ожиданием ответов"""
-        time.sleep(2)  # даём время на HELLO
+        time.sleep(2)
         self.neighbor_info = {}
         for router_id in self.all_routers:
             if router_id != self.id:
@@ -493,9 +466,8 @@ class DesignatedRouter(Router):
     def _handle_set_neighbors(self, message: Message):
         """Получение информации о соседях от маршрутизаторов"""
         router_id = message.source_id
-        neighbors_info = message.data  # список словарей {"neighbor_id":..., "transmission_time":...}
+        neighbors_info = message.data 
         self.neighbor_info[router_id] = neighbors_info
-        # добавляем рёбра в топологию
         for neighbor in neighbors_info:
             neighbor_id = neighbor["neighbor_id"]
             weight = neighbor.get("transmission_time", 0.1)
@@ -519,29 +491,24 @@ class DesignatedRouter(Router):
         """Рассылка топологии всем маршрутизаторам.
         Если передана custom_topology — используется она вместо self.network_topology.
         """
-        # Формируем данные топологии
         if custom_topology is not None:
             topology_data = custom_topology
         else:
-            # Если топология пуста — создаём резервную (линейную)
             if len(self.network_topology.edges()) == 0:
                 nodes = self.all_routers.copy()
                 for i in range(len(nodes) - 1):
                     self.network_topology.add_edge(nodes[i], nodes[i + 1], weight=0.1)
 
-            # Подготавливаем данные топологии для отправки
             topology_data = {
-                "nodes": list(self.network_topology.nodes()),  # включаем DR
+                "nodes": list(self.network_topology.nodes()),
                 "edges": [(u, v, d.get("weight", 1)) for u, v, d in self.network_topology.edges(data=True)]
             }
 
-        # Обновляем локальную топологию DR (для внутреннего хранения)
         self.network_topology.clear()
         self.network_topology.add_nodes_from(topology_data["nodes"])
         for u, v, w in topology_data["edges"]:
             self.network_topology.add_edge(u, v, weight=w)
 
-        # Рассылаем топологию всем маршрутизаторам, кроме DR
         for router_id in self.all_routers:
             if router_id != self.id:
                 message = Message(
@@ -552,7 +519,6 @@ class DesignatedRouter(Router):
                 )
                 self._send_to_neighbor(router_id, message)
 
-        # Логирование
         if self.simulator:
             self.simulator._log_topology_event("TOPOLOGY_BROADCAST", {"topology": topology_data})
         self._log("TOPOLOGY_BROADCAST", {"topology": topology_data})
@@ -564,7 +530,6 @@ class DesignatedRouter(Router):
             self.network_topology.remove_edge(router1_id, router2_id)
             edge_removed = True
 
-        # Отправляем DISCONNECT всем участникам
         for r1, r2 in [(router1_id, router2_id), (router2_id, router1_id)]:
             if r1 in self.simulator.routers:
                 msg = Message(
@@ -577,7 +542,6 @@ class DesignatedRouter(Router):
 
         time.sleep(0.5)
 
-        # Обновляем топологию для всех роутеров
         for router in self.simulator.routers.values():
             if router.id != self.id and router.topology is not None:
                 router.topology = self.network_topology.copy()
@@ -679,12 +643,10 @@ class NetworkSimulator:
     def create_ring_topology(self, num_routers: int = 5):
         self.topology_type = "ring"
 
-        # создаём выделенный маршрутизатор (DR)
         self.designated_router = DesignatedRouter(self)
         self.routers[self.designated_router.id] = self.designated_router
         self.designated_router.add_router(self.designated_router.id)
 
-        # создаём обычные маршрутизаторы
         for i in range(num_routers):
             router = Router(i, self.designated_router.id, self)
             self.routers[i] = router
@@ -692,16 +654,14 @@ class NetworkSimulator:
 
         connections = []
 
-        # соединяем обычные маршрутизаторы в кольцо
         for i in range(num_routers):
-            next_i = (i + 1) % num_routers  # замыкаем кольцо
+            next_i = (i + 1) % num_routers
             link = Link(i, next_i, delay=0.1)
             self.routers[i].add_link(next_i, link)
             self.routers[next_i].add_link(i, link)
             self._store_link(i, next_i, link)
             connections.append((i, next_i, 0.1))
 
-        # связываем всех с DR
         for i in range(num_routers):
             link_dr = Link(i, self.designated_router.id, delay=0.05)
             self.routers[i].add_link(self.designated_router.id, link_dr)
@@ -709,27 +669,26 @@ class NetworkSimulator:
             self._store_link(i, self.designated_router.id, link_dr)
             connections.append((i, self.designated_router.id, 0.05))
 
-        # логируем топологию
         self._log_topology_event("LINKS_CREATED", {"connections": connections})
 
-        # формируем кастомную топологию без самого DR
         custom_topology = {
             "nodes": [i for i in range(num_routers)],
             "edges": [(u, v, w) for (u, v, w) in connections if u != self.designated_router.id and v != self.designated_router.id]
         }
 
-        # DR рассылает топологию всем маршрутизаторам
         self.designated_router._broadcast_topology(custom_topology=custom_topology)
 
     def create_star_topology(self, num_routers: int = 5):
         self.topology_type = "star"
-        self.designated_router = DesignatedRouter(-1, self)
-        self.routers[-1] = self.designated_router
-        self.designated_router.add_router(-1)
+        self.designated_router = DesignatedRouter(self)
+        self.routers[self.designated_router.id] = self.designated_router
+        self.designated_router.add_router(self.designated_router.id)
+
         for i in range(num_routers):
-            router = Router(i, -1, self)
+            router = Router(i, self.designated_router.id, self)
             self.routers[i] = router
             self.designated_router.add_router(i)
+
         connections = []
         center_id = 0
         for i in range(1, num_routers):
@@ -740,12 +699,12 @@ class NetworkSimulator:
                 self._store_link(center_id, i, link)
                 connections.append((center_id, i))
         for i in range(num_routers):
-            if (i, -1) not in self.links:
-                link_dr = Link(i, -1, delay=0.05)
-                self.routers[i].add_link(-1, link_dr)
+            if (i, self.designated_router.id) not in self.links:
+                link_dr = Link(i, self.designated_router.id, delay=0.05)
+                self.routers[i].add_link(self.designated_router.id, link_dr)
                 self.designated_router.add_link(i, link_dr)
-                self._store_link(i, -1, link_dr)
-                connections.append((i, -1))
+                self._store_link(i, self.designated_router.id, link_dr)
+                connections.append((i, self.designated_router.id))
         self._log_topology_event("LINKS_CREATED", {
             "connections": connections,
             "total_links": len(connections)
@@ -759,7 +718,7 @@ class NetworkSimulator:
         """Сохраняем ссылку на канал связи для последующего доступа.
            FIXED: сохраняем обе пары (a,b) и (b,a) указывая на один объект Link."""
         self.links[(router1_id, router2_id)] = link
-        self.links[(router2_id, router1_id)] = link  # обратный ключ тоже
+        self.links[(router2_id, router1_id)] = link
     
     def _write_log(self, log_entry):
         with open(self.log_file, "a", encoding='utf-8') as f:
@@ -770,7 +729,6 @@ class NetworkSimulator:
             router.start()
         print(f"Сетевая симуляция запущена (топология: {self.topology_type})")
         print(f"Логи сохраняются в: {self.log_file}")
-        # даём время на установку соседства и сбор топологии
         time.sleep(16)
         self._test_data_transfer()
         
@@ -789,7 +747,6 @@ class NetworkSimulator:
             print("ПРЕДУПРЕЖДЕНИЕ: Топология пустая! Передача данных невозможна.")
             return
 
-        # Пример: для линейной, кольца и звезды отправляем 0 -> max (num-1)
         if self.topology_type in ("linear", "ring", "star"):
             ids = sorted([
                 r for r in self.routers.keys()
@@ -805,7 +762,6 @@ class NetworkSimulator:
                     print(f"ПРЕДУПРЕЖДЕНИЕ: Нет пути от Router {src} до Router {dst}")
         time.sleep(2)
 
-        # Симулируем разрыв для линейной топологии
         if self.topology_type == "linear":
             print("\n--- Имитация разрыва связи (1-2) ---")
             self.designated_router.simulate_disconnect(1, 2)
@@ -823,9 +779,7 @@ class NetworkSimulator:
                 else:
                     print(f"ПРЕДУПРЕЖДЕНИЕ: Нет пути от Router {src} до Router {dst} после разрыва")
 
-        # Симулируем разрыв для кольцевой топологии
         if self.topology_type == "ring":
-            # Берём два соседних роутера и разрываем соединение
             print("\n--- Имитация разрыва связи (соседние узлы) ---")
             nodes = sorted(self.routers.keys())
             r1 = nodes[0]
@@ -840,6 +794,23 @@ class NetworkSimulator:
                     self.routers[src].send_data(dst, "Test message after ring disconnect")
                 else:
                     print(f"ПРЕДУПРЕЖДЕНИЕ: Нет пути от Router {src} до Router {dst} после разрыва кольца")
+
+        if self.topology_type == "star":
+            print("\n--- Имитация разрыва связи (центр-1) ---")
+            self.designated_router.simulate_disconnect(0, 1)
+            time.sleep(2)
+            print("\n--- Тестирование после разрыва ---")
+            ids = sorted([
+                r for r in self.routers.keys()
+                if r not in (-1, self.designated_router.id)
+            ])
+            if len(ids) >= 2:
+                src = ids[0]
+                dst = ids[-1]
+                if dst in self.routers[src].shortest_paths:
+                    self.routers[src].send_data(dst, "Test message after star disconnect")
+                else:
+                    print(f"ПРЕДУПРЕЖДЕНИЕ: Нет пути от Router {src} до Router {dst} после разрыва звезды")
 
     def stop_simulation(self):
         for router in self.routers.values():
@@ -887,7 +858,6 @@ class NetworkSimulator:
         if self.designated_router:
             print(f"Изменений топологии: {self.designated_router.topology_changes}")
 
-# Функция для интерактивного выбора топологии
 def select_topology():
     print("Доступные топологии:")
     print("1. Линейная")
@@ -906,8 +876,7 @@ def select_topology():
         print("Неверный выбор, используется линейная топология по умолчанию")
         return "linear"
 
-# Запуск симуляции
-# В main части уменьшите общее время симуляции:
+
 if __name__ == "__main__":
     print("=== СИМУЛЯТОР ПРОТОКОЛА OSPF ===")
     
@@ -923,7 +892,7 @@ if __name__ == "__main__":
     
     try:
         simulator.start_simulation()
-        time.sleep(10)  # Уменьшаем общее время симуляции
+        time.sleep(10)
         simulator.print_statistics()
         
     except KeyboardInterrupt:
