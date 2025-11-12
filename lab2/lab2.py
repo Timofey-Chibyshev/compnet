@@ -275,7 +275,12 @@ class Router:
         self._calculate_shortest_paths()
     
     def _calculate_shortest_paths(self):
-        """Вычисление кратчайших путей с помощью алгоритма Дейкстры"""
+        """Вычисление кратчайших путей с защитой от недоступных узлов"""
+        if self.topology is None or len(self.topology.nodes) == 0:
+            self.shortest_paths = {}
+            self._log("PATH_CALCULATION_ERROR", {"error": "Topology is empty"})
+            return
+
         try:
             paths = nx.single_source_dijkstra_path(self.topology, self.id)
             self.shortest_paths = paths
@@ -283,7 +288,13 @@ class Router:
             if self.simulator:
                 self.simulator._log_router_event(self.id, "SHORTEST_PATHS_CALCULATED",
                                                 {"paths": {str(k): v for k, v in paths.items()}})
+        except nx.NetworkXNoPath:
+            self.shortest_paths = {}
+            self._log("PATH_CALCULATION_ERROR", {"error": "No path to some nodes"})
+            if self.simulator:
+                self.simulator._log_router_event(self.id, "PATH_CALCULATION_ERROR", {"error": "No path to some nodes"})
         except Exception as e:
+            self.shortest_paths = {}
             self._log("PATH_CALCULATION_ERROR", {"error": str(e)})
             if self.simulator:
                 self.simulator._log_router_event(self.id, "PATH_CALCULATION_ERROR", {"error": str(e)})
@@ -346,64 +357,33 @@ class Router:
                     "final_destination": message.dest_id,
                     "reason": "No path available"
                 })
-    
+        
     def _handle_disconnect(self, message: Message):
-        """Обработка разрыва связи. message.data = id соседнего роутера, который стал недоступен"""
+        """Обработка разрыва связи. message.data = id соседа, который стал недоступен"""
         router_to_disconnect = message.data
 
-        # Деактивируем link, если он есть
-        if router_to_disconnect in self.links:
-            with self.links[router_to_disconnect].lock:
-                self.links[router_to_disconnect].active = False
+        # Деактивируем линк
+        link = self.links.get(router_to_disconnect)
+        if link:
+            with link.lock:
+                link.active = False
 
-            # Удаляем из списков соседей и полученных HELLO
-            if router_to_disconnect in self.neighbors:
-                try:
-                    self.neighbors.remove(router_to_disconnect)
-                except ValueError:
-                    pass
-            if router_to_disconnect in self.hello_received:
-                try:
-                    self.hello_received.remove(router_to_disconnect)
-                except ValueError:
-                    pass
+        # Удаляем роутер из соседей и hello_received
+        self.neighbors = [r for r in self.neighbors if r != router_to_disconnect]
+        self.hello_received = [r for r in self.hello_received if r != router_to_disconnect]
 
-            # Логируем событие
-            if self.simulator:
-                self.simulator._log_router_event(self.id, "LINK_DISCONNECTED", {
-                    "disconnected_router": router_to_disconnect,
-                    "remaining_neighbors": self.neighbors.copy(),
-                    "remaining_hello": self.hello_received.copy()
-                })
-            self._log("LINK_DISCONNECTED", {
-                "disconnected_router": router_to_disconnect,
-                "remaining_neighbors": self.neighbors.copy(),
-                "remaining_hello": self.hello_received.copy()
-            })
+        # Логирование
+        log_data = {
+            "disconnected_router": router_to_disconnect,
+            "remaining_neighbors": self.neighbors.copy(),
+            "remaining_hello": self.hello_received.copy()
+        }
+        self._log("LINK_DISCONNECTED", log_data)
+        if self.simulator:
+            self.simulator._log_router_event(self.id, "LINK_DISCONNECTED", log_data)
 
-        else:
-            # Попытка найти линк через симулятор (на случай хранения только обратной пары)
-            if self.simulator:
-                link = self.simulator.links.get((self.id, router_to_disconnect)) or self.simulator.links.get((router_to_disconnect, self.id))
-                if link:
-                    with link.lock:
-                        link.active = False
-
-            # Удаление из списков соседей
-            if router_to_disconnect in self.neighbors:
-                try:
-                    self.neighbors.remove(router_to_disconnect)
-                except ValueError:
-                    pass
-            if router_to_disconnect in self.hello_received:
-                try:
-                    self.hello_received.remove(router_to_disconnect)
-                except ValueError:
-                    pass
-
-        # Пересчёт кратчайших путей после разрыва
+        # Пересчёт кратчайших путей безопасно
         self._calculate_shortest_paths()
-
     
     def send_data(self, dest_id: int, data: Any):
         """Отправка данных другому маршрутизатору"""
@@ -549,10 +529,10 @@ class DesignatedRouter(Router):
                 for i in range(len(nodes) - 1):
                     self.network_topology.add_edge(nodes[i], nodes[i + 1], weight=0.1)
 
-            # Отправляем полную топологию всем (включая DR)
+            # Подготавливаем данные топологии для отправки
             topology_data = {
                 "nodes": list(self.network_topology.nodes()),  # включаем DR
-                "edges": [(u, v, d["weight"]) for u, v, d in self.network_topology.edges(data=True)]
+                "edges": [(u, v, d.get("weight", 1)) for u, v, d in self.network_topology.edges(data=True)]
             }
 
         # Обновляем локальную топологию DR (для внутреннего хранения)
@@ -578,44 +558,42 @@ class DesignatedRouter(Router):
         self._log("TOPOLOGY_BROADCAST", {"topology": topology_data})
     
     def simulate_disconnect(self, router1_id: int, router2_id: int):
-        """Имитация разрыва связи между двумя маршрутизаторами"""
+        """Имитация разрыва связи между двумя маршрутизаторами с обновлением топологии всех роутеров"""
         edge_removed = False
         if self.network_topology.has_edge(router1_id, router2_id):
             self.network_topology.remove_edge(router1_id, router2_id)
             edge_removed = True
-        # Отправляем сообщения о разрыве
-        disconnect_msg1 = Message(
-            source_id=self.id,
-            dest_id=router1_id,
-            msg_type=MessageType.DISCONNECT,
-            data=router2_id
-        )
-        self._send_to_neighbor(router1_id, disconnect_msg1)
-        disconnect_msg2 = Message(
-            source_id=self.id,
-            dest_id=router2_id,
-            msg_type=MessageType.DISCONNECT,
-            data=router1_id
-        )
-        self._send_to_neighbor(router2_id, disconnect_msg2)
+
+        # Отправляем DISCONNECT всем участникам
+        for r1, r2 in [(router1_id, router2_id), (router2_id, router1_id)]:
+            if r1 in self.simulator.routers:
+                msg = Message(
+                    source_id=self.id,
+                    dest_id=r1,
+                    msg_type=MessageType.DISCONNECT,
+                    data=r2
+                )
+                self._send_to_neighbor(r1, msg)
+
         time.sleep(0.5)
-        self._broadcast_topology()
+
+        # Обновляем топологию для всех роутеров
+        for router in self.simulator.routers.values():
+            if router.id != self.id and router.topology is not None:
+                router.topology = self.network_topology.copy()
+                router._calculate_shortest_paths()
+
         self.topology_changes += 1
-        if self.simulator:
-            self.simulator._log_topology_event("DISCONNECT_SIMULATED", {
-                "router1": router1_id,
-                "router2": router2_id,
-                "edge_removed": edge_removed,
-                "topology_change_count": self.topology_changes,
-                "current_topology_edges": [(u, v, d['weight']) for u, v, d in self.network_topology.edges(data=True)]
-            })
-        self._log("DISCONNECT_SIMULATED", {
+        log_data = {
             "router1": router1_id,
             "router2": router2_id,
             "edge_removed": edge_removed,
             "topology_change_count": self.topology_changes,
             "current_topology_edges": [(u, v, d['weight']) for u, v, d in self.network_topology.edges(data=True)]
-        })
+        }
+        self._log("DISCONNECT_SIMULATED", log_data)
+        if self.simulator:
+            self.simulator._log_topology_event("DISCONNECT_SIMULATED", log_data)
 
 class NetworkSimulator:
     """Класс для создания и управления сетевой симуляцией"""
